@@ -192,7 +192,7 @@ object RikkaClient {
 
         val isGenerating = obj.optBoolean("isGenerating", false)
 
-        val node: JSONObject? = when (eventName) {
+        val node = when (eventName) {
             "node_update" -> obj.optJSONObject("node")
             "snapshot" -> lastNode(obj.optJSONObject("conversation"))
             else -> null
