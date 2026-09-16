@@ -73,6 +73,57 @@ object BreenoHook {
         )
 
         L.i("hooks installed on $DC_CLASS")
+
+        if (Config.DEBUG_TRACE) installTrace(dcCls)
+    }
+
+    /** Temporary diagnostic: log every entry point we can see. */
+    private fun installTrace(dcCls: Class<*>) {
+        L.i("DEBUG_TRACE: tracing all of $DC_CLASS and AIChatViewBean()")
+        try {
+            de.robv.android.xposed.XposedBridge.hookAllMethods(
+                dcCls, null, object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        try {
+                            val sb = StringBuilder("DC.").append(param.method.name).append('(')
+                            param.args.forEachIndexed { i, a ->
+                                if (i > 0) sb.append(", ")
+                                sb.append(describe(a))
+                            }
+                            L.i(sb.append(')').toString())
+                        } catch (_: Throwable) {
+                        }
+                    }
+                },
+            )
+        } catch (t: Throwable) {
+            L.e("trace all-methods failed", t)
+        }
+
+        try {
+            de.robv.android.xposed.XposedBridge.hookAllConstructors(
+                beanCls, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val b = param.thisObject
+                        L.i(
+                            "bean.new chatType=${intOrNull(b, "getChatType")} " +
+                                "content=${strOrNull(b, "getContent")?.take(80)} " +
+                                "room=${strOrNull(b, "getRoomId")}",
+                        )
+                    }
+                },
+            )
+        } catch (t: Throwable) {
+            L.e("trace constructors failed", t)
+        }
+    }
+
+    private fun describe(a: Any?): String = when {
+        a == null -> "null"
+        beanCls.isInstance(a) ->
+            "bean{chat=${intOrNull(a, "getChatType")} c='${strOrNull(a, "getContent")?.take(60)}'}"
+        a is String -> "'${a.take(60)}'"
+        else -> a.javaClass.simpleName
     }
 
     // ---------------------------------------------------------------- hooks

@@ -33,5 +33,14 @@ object Config {
      */
     const val DRY_RUN = false
 
+    /**
+     * Log every call into AIChatDataCenter plus every AIChatViewBean construction.
+     *
+     * Obfuscated method letters move between Breeno versions, so when the bridge stops
+     * firing this is how you find the new ones: turn it on, trigger one utterance, then
+     * read `logcat -s BrenoRikka` and look for the call carrying the user's text.
+     */
+    const val DEBUG_TRACE = true
+
     val baseUrl: String get() = "http://$RIKKAHUB_HOST:$RIKKAHUB_PORT"
 }
