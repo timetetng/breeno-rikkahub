@@ -129,31 +129,61 @@ object BreenoHook {
         } catch (t: Throwable) {
             L.e("bean constructor trace failed", t)
         }
+
+        // Whoever builds a bean has to fill in its text; tracing the setter catches the
+        // utterance even when it never reaches a data center we know about.
+        try {
+            XposedBridge.hookMethod(
+                beanCls.getDeclaredMethod("setContent", String::class.java),
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val s = param.args.getOrNull(0) as? String ?: return
+                        if (s.isEmpty() || s.startsWith(RECORD_PREFIX)) return
+                        L.i("setContent('${s.take(100)}') <-${caller()}")
+                    }
+                },
+            )
+            L.i("bean.setContent trace installed")
+        } catch (t: Throwable) {
+            L.e("bean.setContent trace failed", t)
+        }
     }
 
     /** Diagnostic: log every entry point we can see. */
     private fun installTrace(dcCls: Class<*>) {
-        try {
-            XposedBridge.hookAllMethods(
-                dcCls, null, object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        try {
-                            val sb = StringBuilder(">> ").append(param.method.name).append('(')
-                            param.args.forEachIndexed { i, a ->
-                                if (i > 0) sb.append(", ")
-                                sb.append(describe(a))
+        var n = 0
+        dcCls.declaredMethods.forEach { m ->
+            if (m.name.contains('$')) return@forEach
+            val one = m
+            runCatching {
+                XposedBridge.hookMethod(
+                    one, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) {
+                            try {
+                                val sb = StringBuilder(">> ").append(dcCls.simpleName)
+                                    .append('.').append(param.method.name).append('(')
+                                param.args.forEachIndexed { i, a ->
+                                    if (i > 0) sb.append(", ")
+                                    sb.append(describe(a))
+                                }
+                                L.i(sb.append(')').toString())
+                            } catch (_: Throwable) {
                             }
-                            L.i(sb.append(')').toString())
-                        } catch (_: Throwable) {
                         }
-                    }
-                },
-            )
-            L.i("trace installed on ${dcCls.simpleName}")
-        } catch (t: Throwable) {
-            L.e("trace failed on ${dcCls.simpleName}", t)
+                    },
+                )
+                n++
+            }
         }
+        L.i("trace: hooked $n methods on ${dcCls.simpleName}")
     }
+
+    /** Best-effort caller chain, enough to tell which layer built a bean. */
+    private fun caller(): String =
+        Throwable().stackTrace
+            .drop(4)
+            .take(4)
+            .joinToString(" <-") { "${it.className.substringAfterLast('.')}.${it.methodName}" }
 
     // ---------------------------------------------------------------- hooks
 
