@@ -3,6 +3,7 @@ package com.timetetng.breeno.bridge
 import android.os.Handler
 import android.os.Looper
 import de.robv.android.xposed.XC_MethodHook
+import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -10,26 +11,44 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * The actual bridge.
  *
- * Breeno renders its chat by pushing [AIChatViewBean] objects through
- * `AIChatDataCenter`. Two methods matter:
+ * Breeno renders its chat by pushing [AIChatViewBean] objects into a data center. The
+ * tricky part is that the data layer exists **twice** in 11.8.3:
  *
- *   `J(Lcom/heytap/speechassist/aichat/bean/AIChatViewBean;)V` — insert a message
- *   `E(Lcom/heytap/speechassist/aichat/bean/AIChatViewBean;Z)V` — update the last one
+ *   com.heytap.speechassist.aichat.AIChatDataCenter
+ *       the legacy one, methods obfuscated to single letters
+ *       (J = insert, E = update). Hooking it looks like it works and then never fires.
  *
- * (These are the obfuscated names on Breeno 11.8.3 / versionCode 110803; the shapes are
- * stable across versions even when the letters change — see README for how to re-derive
- * them with dexdump.)
+ *   com.heytap.speechassist.pluginAdapter.aichat.AIChatDataCenter
+ *       the one the current CUI actually drives, method names intact:
+ *       addChatBeanData(bean) / notifyUpdateView(bean, boolean)
  *
- * So: watch `J` for chatType == TYPE_QUERY (the user's utterance), hand the text to
- * RikkaHub, and paint the answer that comes back through the SSE stream as our own beans.
- * Native answers are dropped so the two don't fight over the same bubble.
+ * Both are hooked; whichever carries traffic wins. The insert/update pair of the
+ * whichever class fired is remembered per turn so the answer is painted back through
+ * the same door.
  */
 object BreenoHook {
 
-    private const val DC_CLASS = "com.heytap.speechassist.aichat.AIChatDataCenter"
     private const val BEAN_CLASS = "com.heytap.speechassist.aichat.bean.AIChatViewBean"
-
     private const val RECORD_PREFIX = "rikkahub_"
+
+    private data class Target(
+        val className: String,
+        val insert: String,
+        val update: String,
+    )
+
+    private val DATA_CENTERS = listOf(
+        Target(
+            className = "com.heytap.speechassist.pluginAdapter.aichat.AIChatDataCenter",
+            insert = "addChatBeanData",
+            update = "notifyUpdateView",
+        ),
+        Target(
+            className = "com.heytap.speechassist.aichat.AIChatDataCenter",
+            insert = "J",
+            update = "E",
+        ),
+    )
 
     private val main = Handler(Looper.getMainLooper())
 
@@ -41,6 +60,7 @@ object BreenoHook {
     private class Turn(
         val roomId: String,
         val recordId: String,
+        val target: Target,
         @Volatile var dataCenter: Any?,
     ) {
         @Volatile var handle: RikkaClient.StreamHandle? = null
@@ -50,42 +70,54 @@ object BreenoHook {
     }
 
     private val turns = ConcurrentHashMap<String, Turn>()
+
+    @Volatile
     private var lastInputKey: String = ""
 
     // ---------------------------------------------------------------- install
 
     fun install(cl: ClassLoader) {
         beanCls = XposedHelpers.findClass(BEAN_CLASS, cl)
-        val dcCls = XposedHelpers.findClass(DC_CLASS, cl)
-
         typeQuery = staticIntOr(beanCls, "TYPE_QUERY", typeQuery)
         typeAnswer = staticIntOr(beanCls, "TYPE_ANSWER", typeAnswer)
         L.i("resolved types: query=$typeQuery answer=$typeAnswer")
 
-        XposedHelpers.findAndHookMethod(dcCls, "J", beanCls, object : XC_MethodHook() {
-            override fun beforeHookedMethod(param: MethodHookParam) = onInsert(param)
-        })
-
-        XposedHelpers.findAndHookMethod(
-            dcCls, "E", beanCls, java.lang.Boolean.TYPE, object : XC_MethodHook() {
-                override fun beforeHookedMethod(param: MethodHookParam) = onUpdate(param)
-            },
-        )
-
-        L.i("hooks installed on $DC_CLASS")
-
-        if (Config.DEBUG_TRACE) installTrace(dcCls)
+        var installed = 0
+        for (target in DATA_CENTERS) {
+            val dcCls = runCatching { XposedHelpers.findClass(target.className, cl) }.getOrNull()
+            if (dcCls == null) {
+                L.w("class not found: ${target.className}")
+                continue
+            }
+            try {
+                XposedHelpers.findAndHookMethod(
+                    dcCls, target.insert, beanCls, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) = onDataCall(param, target)
+                    },
+                )
+                XposedHelpers.findAndHookMethod(
+                    dcCls, target.update, beanCls, java.lang.Boolean.TYPE, object : XC_MethodHook() {
+                        override fun beforeHookedMethod(param: MethodHookParam) = onDataCall(param, target)
+                    },
+                )
+                installed++
+                L.i("hooked ${target.className} [${target.insert}/${target.update}]")
+                if (Config.DEBUG_TRACE) installTrace(dcCls)
+            } catch (t: Throwable) {
+                L.e("hooking ${target.className} failed", t)
+            }
+        }
+        L.i("installed $installed/${DATA_CENTERS.size} data-center hooks")
     }
 
-    /** Temporary diagnostic: log every entry point we can see. */
+    /** Diagnostic: log every entry point we can see. */
     private fun installTrace(dcCls: Class<*>) {
-        L.i("DEBUG_TRACE: tracing all of $DC_CLASS and AIChatViewBean()")
         try {
-            de.robv.android.xposed.XposedBridge.hookAllMethods(
+            XposedBridge.hookAllMethods(
                 dcCls, null, object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
                         try {
-                            val sb = StringBuilder("DC.").append(param.method.name).append('(')
+                            val sb = StringBuilder(">> ").append(param.method.name).append('(')
                             param.args.forEachIndexed { i, a ->
                                 if (i > 0) sb.append(", ")
                                 sb.append(describe(a))
@@ -96,83 +128,42 @@ object BreenoHook {
                     }
                 },
             )
+            L.i("trace installed on ${dcCls.simpleName}")
         } catch (t: Throwable) {
-            L.e("trace all-methods failed", t)
+            L.e("trace failed on ${dcCls.simpleName}", t)
         }
-
-        try {
-            de.robv.android.xposed.XposedBridge.hookAllConstructors(
-                beanCls, object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val b = param.thisObject
-                        L.i(
-                            "bean.new chatType=${intOrNull(b, "getChatType")} " +
-                                "content=${strOrNull(b, "getContent")?.take(80)} " +
-                                "room=${strOrNull(b, "getRoomId")}",
-                        )
-                    }
-                },
-            )
-        } catch (t: Throwable) {
-            L.e("trace constructors failed", t)
-        }
-    }
-
-    private fun describe(a: Any?): String = when {
-        a == null -> "null"
-        beanCls.isInstance(a) ->
-            "bean{chat=${intOrNull(a, "getChatType")} c='${strOrNull(a, "getContent")?.take(60)}'}"
-        a is String -> "'${a.take(60)}'"
-        else -> a.javaClass.simpleName
     }
 
     // ---------------------------------------------------------------- hooks
 
-    private fun onInsert(param: XC_MethodHook.MethodHookParam) {
+    /** Single entry point for both insert and update calls on either data center. */
+    private fun onDataCall(param: XC_MethodHook.MethodHookParam, target: Target) {
         try {
             val bean = param.args.getOrNull(0) ?: return
             val chatType = intOrNull(bean, "getChatType") ?: return
+            val recordId = strOrNull(bean, "getRecordId")
+            val isOurs = recordId != null && recordId.startsWith(RECORD_PREFIX)
 
             if (chatType == typeQuery) {
                 val roomId = strOrNull(bean, "getRoomId").orEmpty()
                 val query = strOrNull(bean, "getContent")
                 L.i("user input room=$roomId text=${query?.take(200)}")
-                if (!query.isNullOrBlank()) startTurn(param.thisObject, roomId, query)
+                if (!query.isNullOrBlank()) startTurn(param.thisObject, target, roomId, query)
                 return
             }
 
-            if (chatType == typeAnswer && isForeignAnswer(bean)) {
-                if (Config.DRY_RUN) return
-                L.i("dropping native answer (record=${strOrNull(bean, "getRecordId")})")
+            if (chatType == typeAnswer && !isOurs && !Config.DRY_RUN) {
+                L.i("dropping native answer (record=$recordId)")
                 param.result = null
             }
         } catch (t: Throwable) {
-            L.e("onInsert failed", t)
+            L.e("onDataCall failed", t)
         }
-    }
-
-    private fun onUpdate(param: XC_MethodHook.MethodHookParam) {
-        try {
-            val bean = param.args.getOrNull(0) ?: return
-            val chatType = intOrNull(bean, "getChatType") ?: return
-            if (chatType == typeAnswer && isForeignAnswer(bean)) {
-                if (Config.DRY_RUN) return
-                param.result = null
-            }
-        } catch (t: Throwable) {
-            L.e("onUpdate failed", t)
-        }
-    }
-
-    /** True when this answer did not originate from us. */
-    private fun isForeignAnswer(bean: Any): Boolean {
-        val record = strOrNull(bean, "getRecordId")
-        return record == null || !record.startsWith(RECORD_PREFIX)
     }
 
     // ---------------------------------------------------------------- turn lifecycle
 
-    private fun startTurn(dataCenter: Any, roomId: String, query: String) {
+    private fun startTurn(dataCenter: Any, target: Target, roomId: String, query: String) {
         val key = "$roomId|$query"
         synchronized(this) {
             if (key == lastInputKey) {
@@ -188,7 +179,7 @@ object BreenoHook {
 
         turns[roomId]?.handle?.close()
 
-        val turn = Turn(roomId, RECORD_PREFIX + UUID.randomUUID(), dataCenter)
+        val turn = Turn(roomId, RECORD_PREFIX + UUID.randomUUID(), target, dataCenter)
         turns[roomId] = turn
 
         RikkaClient.submit {
@@ -226,11 +217,11 @@ object BreenoHook {
             val bean = buildAnswerBean(turn, text, first, isFinal)
 
             if (first) {
-                XposedHelpers.callMethod(dataCenter, "J", bean)
+                XposedHelpers.callMethod(dataCenter, turn.target.insert, bean)
                 turn.inserted = true
-                L.i("inserted answer record=${turn.recordId} len=${text.length}")
+                L.i("inserted answer via ${turn.target.insert} record=${turn.recordId} len=${text.length}")
             } else {
-                XposedHelpers.callMethod(dataCenter, "E", bean, false)
+                XposedHelpers.callMethod(dataCenter, turn.target.update, bean, false)
             }
 
             if (isFinal) {
@@ -277,6 +268,14 @@ object BreenoHook {
 
     private fun strOrNull(target: Any, method: String): String? =
         runCatching { XposedHelpers.callMethod(target, method) as? String }.getOrNull()
+
+    private fun describe(a: Any?): String = when {
+        a == null -> "null"
+        beanCls.isInstance(a) ->
+            "bean{chat=${intOrNull(a, "getChatType")} c='${strOrNull(a, "getContent")?.take(60)}'}"
+        a is String -> "'${a.take(60)}'"
+        else -> a.javaClass.simpleName
+    }
 
     private fun Any.set(method: String, vararg args: Any?): Any? =
         runCatching { XposedHelpers.callMethod(this, method, *args) }
