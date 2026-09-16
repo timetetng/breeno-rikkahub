@@ -108,6 +108,27 @@ object BreenoHook {
             }
         }
         L.i("installed $installed/${DATA_CENTERS.size} data-center hooks")
+
+        // Every user utterance and every answer is an AIChatViewBean that somebody
+        // constructed; tracing the constructor is the surest way to see traffic that
+        // never reaches the data center.
+        try {
+            XposedBridge.hookAllConstructors(
+                beanCls, object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        val b = param.thisObject
+                        L.i(
+                            "bean.new chatType=${intOrNull(b, "getChatType")} " +
+                                "record=${strOrNull(b, "getRecordId")} " +
+                                "content=${strOrNull(b, "getContent")?.take(80)}",
+                        )
+                    }
+                },
+            )
+            L.i("bean constructor trace installed")
+        } catch (t: Throwable) {
+            L.e("bean constructor trace failed", t)
+        }
     }
 
     /** Diagnostic: log every entry point we can see. */
@@ -140,20 +161,22 @@ object BreenoHook {
     private fun onDataCall(param: XC_MethodHook.MethodHookParam, target: Target) {
         try {
             val bean = param.args.getOrNull(0) ?: return
-            val chatType = intOrNull(bean, "getChatType") ?: return
+            val chatType = intOrNull(bean, "getChatType")
             val recordId = strOrNull(bean, "getRecordId")
+            val content = strOrNull(bean, "getContent")
+            val roomId = strOrNull(bean, "getRoomId").orEmpty()
             val isOurs = recordId != null && recordId.startsWith(RECORD_PREFIX)
 
+            if (!isOurs) {
+                L.i("${param.method.name} chatType=$chatType room=$roomId content=${content?.take(120)}")
+            }
+
             if (chatType == typeQuery) {
-                val roomId = strOrNull(bean, "getRoomId").orEmpty()
-                val query = strOrNull(bean, "getContent")
-                L.i("user input room=$roomId text=${query?.take(200)}")
-                if (!query.isNullOrBlank()) startTurn(param.thisObject, target, roomId, query)
+                if (!content.isNullOrBlank()) startTurn(param.thisObject, target, roomId, content)
                 return
             }
 
             if (chatType == typeAnswer && !isOurs && !Config.DRY_RUN) {
-                L.i("dropping native answer (record=$recordId)")
                 param.result = null
             }
         } catch (t: Throwable) {
